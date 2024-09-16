@@ -134,12 +134,13 @@ def get_roles(token_claims: Dict[str, Any]) -> List[str]:
 
 def require_roles(roles: List[str]):
     def decorator(func):
-        async def wrapper(request: Request, token: str = Depends(token_auth_scheme)):
+        async def wrapper(request: Request, token: HTTPAuthorizationCredentials = Depends(token_auth_scheme), db: Session = Depends(get_db)):
             token_claims = get_token_claims(token.credentials)
-            user_roles = get_roles(token_claims)
+            user = refresh_user_data(db, token_claims)
+            user_roles = [role.name for role in user.roles]
             if not any(role in user_roles for role in roles):
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
-            return await func(token_claims)
+            return await func(token_claims, db)
         return wrapper
     return decorator
 
@@ -201,31 +202,98 @@ async def get_api_key(api_key: str = Header(..., alias="X-API-Key"), db: Session
     
     return db_api_key.organization
 
+async def get_org_from_api_key(api_key: str = Header(..., alias="X-API-Key"), db: Session = Depends(get_db)):
+    db_api_key = db.query(APIKey).filter(APIKey.key == api_key).first()
+    if not db_api_key:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API Key")
+    
+    db_api_key.last_used = datetime.utcnow()
+    db.commit()
+    
+    organization = db.query(Organization).filter(Organization.id == db_api_key.org_id).first()
+    if not organization:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
+    
+    return organization
+
+def refresh_user_data(db: Session, user_info: dict):
+    user_id = user_info['sub']
+    user = db.query(User).filter(User.id == user_id).first()
+    
+    if not user:
+        user = User(id=user_id)
+        db.add(user)
+    
+    # Update user information
+    user.name = user_info.get('name', '')
+    
+    # Update or create organization
+    org_id = user_info.get('https://watchhousesspm.com/org_id')
+    org_name = user_info.get('https://watchhousesspm.com/org_name')
+    if org_id and org_name:
+        org = db.query(Organization).filter(Organization.id == org_id).first()
+        if not org:
+            org = Organization(id=org_id, name=org_name)
+            db.add(org)
+        elif org.name != org_name:
+            org.name = org_name  # Update org name if it has changed
+        
+        # Ensure user is associated with this organization
+        if org not in user.organizations:
+            user.organizations = [org]  # Replace existing org with the new one
+    elif user.organizations:
+        # Remove organization association if org_id is not present in token
+        user.organizations = []
+    
+    # Update roles
+    new_roles = set(user_info.get('https://watchhousesspm.com/roles', []))
+    current_roles = set(role.name for role in user.roles)
+    
+    # Remove roles that are no longer present
+    for role in user.roles[:]:
+        if role.name not in new_roles:
+            user.roles.remove(role)
+    
+    # Add new roles
+    for role_name in new_roles:
+        if role_name not in current_roles:
+            role = db.query(Role).filter(Role.name == role_name).first()
+            if not role:
+                role = Role(name=role_name)
+                db.add(role)
+            user.roles.append(role)
+    
+    db.commit()
+    db.refresh(user)
+    return user
+
 @app.get("/", status_code=status.HTTP_200_OK)
 async def root():
     return {"message": "Hello World"}
 
 @app.get("/protected", status_code=status.HTTP_200_OK)
 @require_roles(["User"])
-async def protected_route(token_claims: Dict[str, Any]):
+async def protected_route(token_claims: Dict[str, Any], db: Session = Depends(get_db)):
+    user = refresh_user_data(db, token_claims)
     return {
         "message": "This is a protected route",
-        "user": token_claims.get('email') or token_claims.get('https://watchhousesspm.com/user_name')
+        "user": user.name
     }
 
 @app.get("/admin", status_code=status.HTTP_200_OK)
 @require_roles(["Admin"])
-async def admin_route(token_claims: Dict[str, Any]):
+async def admin_route(token_claims: Dict[str, Any], db: Session = Depends(get_db)):
+    user = refresh_user_data(db, token_claims)
     return {
         "message": "This is an admin route",
-        "user": token_claims.get('email') or token_claims.get('https://watchhousesspm.com/user_name')
+        "user": user.name
     }
 
 @app.get("/user_info", status_code=status.HTTP_200_OK)
 async def user_info(token: HTTPAuthorizationCredentials = Depends(token_auth_scheme), db: Session = Depends(get_db)):
     try:
         token_claims = get_token_claims(token.credentials)
-        user = get_or_create_user(db, token_claims)
+        user = refresh_user_data(db, token_claims)
         return {
             "user_id": user.id,
             "name": user.name,
@@ -237,34 +305,102 @@ async def user_info(token: HTTPAuthorizationCredentials = Depends(token_auth_sch
         logger.error(f"Error in user_info endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
+def refresh_user_data(db: Session, user_info: dict):
+    user_id = user_info['sub']
+    user = db.query(User).filter(User.id == user_id).first()
+    
+    if not user:
+        user = User(id=user_id)
+        db.add(user)
+    
+    user.name = user_info.get('name', '')
+    
+    # Update or create organization
+    org_id = user_info.get('https://watchhousesspm.com/org_id')
+    org_name = user_info.get('https://watchhousesspm.com/org_name')
+    if org_id and org_name:
+        org = db.query(Organization).filter(Organization.id == org_id).first()
+        if not org:
+            org = Organization(id=org_id, name=org_name)
+            db.add(org)
+        elif org.name != org_name:
+            org.name = org_name
+        
+        if org not in user.organizations:
+            user.organizations = [org]
+    elif user.organizations:
+        user.organizations = []
+    
+    # Update roles
+    new_roles = set(user_info.get('https://watchhousesspm.com/roles', []))
+    current_roles = set(role.name for role in user.roles)
+    
+    for role in user.roles[:]:
+        if role.name not in new_roles:
+            user.roles.remove(role)
+    
+    for role_name in new_roles:
+        if role_name not in current_roles:
+            role = db.query(Role).filter(Role.name == role_name).first()
+            if not role:
+                role = Role(name=role_name)
+                db.add(role)
+            user.roles.append(role)
+    
+    db.commit()
+    db.refresh(user)
+    return user
+
 # API KEYS
 
 @app.post("/api-keys", status_code=status.HTTP_201_CREATED)
-@require_roles(["Admin"])
-async def create_api_key(org_id: str, db: Session = Depends(get_db), token: HTTPAuthorizationCredentials = Depends(token_auth_scheme)):
+async def create_api_key(
+    db: Session = Depends(get_db), 
+    token: HTTPAuthorizationCredentials = Depends(token_auth_scheme)
+):
     token_claims = get_token_claims(token.credentials)
     user_org_id = token_claims.get('https://watchhousesspm.com/org_id')
     
-    if user_org_id != org_id:
-        raise HTTPException(status_code=403, detail="You can only create API keys for your own organization")
+    if not user_org_id:
+        raise HTTPException(status_code=400, detail="User does not belong to an organization")
     
-    api_key = generate_api_key(db, org_id)
+    if "Admin" not in get_roles(token_claims):
+        raise HTTPException(status_code=403, detail="Only admins can create API keys")
+    
+    api_key = generate_api_key(db, user_org_id)
     return {"api_key": api_key}
 
 @app.get("/api-keys", status_code=status.HTTP_200_OK)
-@require_roles(["Admin"])
-async def list_api_keys(db: Session = Depends(get_db), token: HTTPAuthorizationCredentials = Depends(token_auth_scheme)):
+async def list_api_keys(
+    db: Session = Depends(get_db), 
+    token: HTTPAuthorizationCredentials = Depends(token_auth_scheme)
+):
     token_claims = get_token_claims(token.credentials)
     org_id = token_claims.get('https://watchhousesspm.com/org_id')
     
+    if not org_id:
+        raise HTTPException(status_code=400, detail="User does not belong to an organization")
+    
+    if "Admin" not in get_roles(token_claims):
+        raise HTTPException(status_code=403, detail="Only admins can list API keys")
+    
     api_keys = db.query(APIKey).filter(APIKey.org_id == org_id).all()
-    return {"api_keys": [{"id": key.id, "created_at": key.created_at, "last_used": key.last_used} for key in api_keys]}
+    return {"api_keys": [{"id": key.id, "key": key.key, "created_at": key.created_at, "last_used": key.last_used} for key in api_keys]}
 
 @app.delete("/api-keys/{key_id}", status_code=status.HTTP_204_NO_CONTENT)
-@require_roles(["Admin"])
-async def delete_api_key(key_id: str, db: Session = Depends(get_db), token: HTTPAuthorizationCredentials = Depends(token_auth_scheme)):
+async def delete_api_key(
+    key_id: str, 
+    db: Session = Depends(get_db), 
+    token: HTTPAuthorizationCredentials = Depends(token_auth_scheme)
+):
     token_claims = get_token_claims(token.credentials)
     org_id = token_claims.get('https://watchhousesspm.com/org_id')
+    
+    if not org_id:
+        raise HTTPException(status_code=400, detail="User does not belong to an organization")
+    
+    if "Admin" not in get_roles(token_claims):
+        raise HTTPException(status_code=403, detail="Only admins can delete API keys")
     
     api_key = db.query(APIKey).filter(APIKey.id == key_id, APIKey.org_id == org_id).first()
     if not api_key:
@@ -273,6 +409,15 @@ async def delete_api_key(key_id: str, db: Session = Depends(get_db), token: HTTP
     db.delete(api_key)
     db.commit()
     return
+
+@app.get("/api/org-data", status_code=status.HTTP_200_OK)
+async def get_org_data(org: Organization = Depends(get_org_from_api_key)):
+    return {
+        "org_id": org.id,
+        "org_name": org.name,
+        "user_count": len(org.users),
+        "api_key_count": len(org.api_keys)
+    }
 
 if __name__ == "__main__":
     import uvicorn
