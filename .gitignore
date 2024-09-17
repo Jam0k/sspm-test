@@ -1,1 +1,4 @@
 venv/
+node_modules
+auth_store.db
+server/auth_store.db

@@ -1,5 +1,6 @@
 import logging
 import secrets
+import time
 from fastapi import FastAPI, Depends, HTTPException, Header, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,15 +8,16 @@ from sqlalchemy import DateTime, create_engine, Column, Integer, String, Foreign
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
 from sqlalchemy.exc import IntegrityError
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 import jwt
 from jwt import PyJWKClient
 from functools import lru_cache
 from datetime import datetime
+from cachetools import TTLCache
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 # Database setup
@@ -51,6 +53,7 @@ class Organization(Base):
     name = Column(String)
     users = relationship("User", secondary=user_organizations, back_populates="organizations")
     api_keys = relationship("APIKey", back_populates="organization")
+    devices = relationship("Device", back_populates="organization")  # Add this line
 
 class Role(Base):
     __tablename__ = "roles"
@@ -70,15 +73,44 @@ class APIKey(Base):
 
     organization = relationship("Organization", back_populates="api_keys")
 
+# New Device model
+class Device(Base):
+    __tablename__ = "devices"
+
+    id = Column(String, primary_key=True, index=True)
+    org_id = Column(String, ForeignKey('organizations.id'))
+    uuid = Column(String, unique=True, index=True)
+    internal_ip = Column(String)
+    last_seen = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    organization = relationship("Organization", back_populates="devices")  # Update this line
+
+# Update the DeviceRegister model
+class DeviceRegister(BaseModel):
+    uuid: str
+    internal_ip: str
+
+class DeviceRegister(BaseModel):
+    uuid: str
+    internal_ip: Optional[str]
+    session_id: str
+
+class DeviceHeartbeat(BaseModel):
+    uuid: str
+
+class DeviceUpdateIP(BaseModel):
+    uuid: str
+    internal_ip: Optional[str] = Field(None)
+
 # Create tables
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
-# CORS configuration
+# CORS configuration with multiple origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:5500"],  # Update this with your frontend URL
+    allow_origins=["*"],  # This allows all origins
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -100,14 +132,23 @@ def get_db():
     finally:
         db.close()
 
+# Create a cache with a 1-hour TTL
+jwks_client_cache = TTLCache(maxsize=1, ttl=3600)
+
 @lru_cache()
 def get_jwks_client():
-    return PyJWKClient(f"https://{AUTH0_DOMAIN}/.well-known/jwks.json")
+    if 'client' not in jwks_client_cache:
+        jwks_client_cache['client'] = PyJWKClient(f"https://{AUTH0_DOMAIN}/.well-known/jwks.json")
+    return jwks_client_cache['client']
 
 def get_token_claims(token: str) -> Dict[str, Any]:
     try:
+        start_time = time.time()
         jwks_client = get_jwks_client()
         signing_key = jwks_client.get_signing_key_from_jwt(token)
+        logger.debug(f"Signing key retrieved in {time.time() - start_time:.2f} seconds")
+
+        decode_start = time.time()
         claims = jwt.decode(
             token,
             signing_key.key,
@@ -120,6 +161,7 @@ def get_token_claims(token: str) -> Dict[str, Any]:
                 "leeway": 120  # 2 minutes leeway
             }
         )
+        logger.debug(f"Token decoded in {time.time() - decode_start:.2f} seconds")
         return claims
     except jwt.PyJWTError as e:
         logger.error(f"Token validation error: {str(e)}")
@@ -267,6 +309,8 @@ def refresh_user_data(db: Session, user_info: dict):
     db.refresh(user)
     return user
 
+
+
 @app.get("/", status_code=status.HTTP_200_OK)
 async def root():
     return {"message": "Hello World"}
@@ -291,31 +335,45 @@ async def admin_route(token_claims: Dict[str, Any], db: Session = Depends(get_db
 
 @app.get("/user_info", status_code=status.HTTP_200_OK)
 async def user_info(token: HTTPAuthorizationCredentials = Depends(token_auth_scheme), db: Session = Depends(get_db)):
+    start_time = time.time()
     try:
+        logger.debug("Starting user_info request")
+        token_claims_time = time.time()
         token_claims = get_token_claims(token.credentials)
+        logger.debug(f"Token claims retrieved in {time.time() - token_claims_time:.2f} seconds")
+
+        refresh_time = time.time()
         user = refresh_user_data(db, token_claims)
-        return {
+        logger.debug(f"User data refreshed in {time.time() - refresh_time:.2f} seconds")
+
+        result = {
             "user_id": user.id,
             "name": user.name,
             "org_id": user.organizations[0].id if user.organizations else None,
             "org_name": user.organizations[0].name if user.organizations else None,
             "roles": [role.name for role in user.roles]
         }
+        logger.debug(f"Total user_info request time: {time.time() - start_time:.2f} seconds")
+        return result
     except Exception as e:
         logger.error(f"Error in user_info endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 def refresh_user_data(db: Session, user_info: dict):
+    start_time = time.time()
     user_id = user_info['sub']
+    logger.debug(f"Refreshing data for user {user_id}")
+
     user = db.query(User).filter(User.id == user_id).first()
-    
     if not user:
         user = User(id=user_id)
         db.add(user)
-    
+        logger.debug(f"Created new user {user_id}")
+
     user.name = user_info.get('name', '')
-    
+
     # Update or create organization
+    org_time = time.time()
     org_id = user_info.get('https://watchhousesspm.com/org_id')
     org_name = user_info.get('https://watchhousesspm.com/org_name')
     if org_id and org_name:
@@ -323,21 +381,28 @@ def refresh_user_data(db: Session, user_info: dict):
         if not org:
             org = Organization(id=org_id, name=org_name)
             db.add(org)
+            logger.debug(f"Created new organization {org_id}")
         elif org.name != org_name:
             org.name = org_name
+            logger.debug(f"Updated organization name for {org_id}")
         
         if org not in user.organizations:
             user.organizations = [org]
+            logger.debug(f"Associated user {user_id} with organization {org_id}")
     elif user.organizations:
         user.organizations = []
-    
+        logger.debug(f"Removed organization association for user {user_id}")
+    logger.debug(f"Organization update took {time.time() - org_time:.2f} seconds")
+
     # Update roles
+    roles_time = time.time()
     new_roles = set(user_info.get('https://watchhousesspm.com/roles', []))
     current_roles = set(role.name for role in user.roles)
     
     for role in user.roles[:]:
         if role.name not in new_roles:
             user.roles.remove(role)
+            logger.debug(f"Removed role {role.name} from user {user_id}")
     
     for role_name in new_roles:
         if role_name not in current_roles:
@@ -345,10 +410,17 @@ def refresh_user_data(db: Session, user_info: dict):
             if not role:
                 role = Role(name=role_name)
                 db.add(role)
+                logger.debug(f"Created new role {role_name}")
             user.roles.append(role)
-    
+            logger.debug(f"Added role {role_name} to user {user_id}")
+    logger.debug(f"Roles update took {time.time() - roles_time:.2f} seconds")
+
+    commit_time = time.time()
     db.commit()
     db.refresh(user)
+    logger.debug(f"Database commit and refresh took {time.time() - commit_time:.2f} seconds")
+
+    logger.debug(f"Total refresh_user_data time: {time.time() - start_time:.2f} seconds")
     return user
 
 # API KEYS
@@ -418,6 +490,137 @@ async def get_org_data(org: Organization = Depends(get_org_from_api_key)):
         "user_count": len(org.users),
         "api_key_count": len(org.api_keys)
     }
+
+
+
+
+
+
+# Device mgmt
+
+# New endpoints for device management
+@app.post("/register-device", status_code=status.HTTP_200_OK)
+async def register_device(
+    device: DeviceRegister,
+    organization: Organization = Depends(get_org_from_api_key),
+    db: Session = Depends(get_db)
+):
+    existing_device = db.query(Device).filter(Device.uuid == device.uuid, Device.org_id == organization.id).first()
+    
+    if existing_device:
+        # Update existing device
+        existing_device.internal_ip = device.internal_ip
+        existing_device.last_seen = datetime.utcnow()
+        message = "Device updated successfully"
+    else:
+        # Create new device
+        new_device = Device(
+            id=secrets.token_urlsafe(16),
+            org_id=organization.id,
+            uuid=device.uuid,
+            internal_ip=device.internal_ip
+        )
+        db.add(new_device)
+        message = "Device registered successfully"
+    
+    db.commit()
+    return {"message": message}
+
+# Add a new endpoint to list devices for an organization
+@app.get("/devices", status_code=status.HTTP_200_OK)
+async def list_devices(
+    token: HTTPAuthorizationCredentials = Depends(token_auth_scheme),
+    db: Session = Depends(get_db)
+):
+    token_claims = get_token_claims(token.credentials)
+    org_id = token_claims.get('https://watchhousesspm.com/org_id')
+    
+    if not org_id:
+        raise HTTPException(status_code=400, detail="User does not belong to an organization")
+    
+    devices = db.query(Device).filter(Device.org_id == org_id).all()
+    return {
+        "devices": [
+            {
+                "id": device.id,
+                "uuid": device.uuid,
+                "internal_ip": device.internal_ip,
+                "last_seen": device.last_seen
+            } for device in devices
+        ]
+    }
+
+@app.post("/update-device", status_code=status.HTTP_200_OK)
+async def update_device(
+    device: DeviceRegister,
+    organization: Organization = Depends(get_org_from_api_key),
+    db: Session = Depends(get_db)
+):
+    existing_device = db.query(Device).filter(Device.uuid == device.uuid, Device.org_id == organization.id).first()
+    
+    if not existing_device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    
+    existing_device.internal_ip = device.internal_ip
+    existing_device.last_heartbeat = datetime.utcnow()
+    existing_device.session_id = device.session_id
+    
+    db.commit()
+    return {"message": "Device updated successfully"}
+
+@app.post("/heartbeat", status_code=status.HTTP_200_OK)
+async def heartbeat(
+    device: DeviceHeartbeat,
+    organization: Organization = Depends(get_org_from_api_key),
+    db: Session = Depends(get_db)
+):
+    db_device = db.query(Device).filter(Device.uuid == device.uuid, Device.org_id == organization.id).first()
+    if db_device:
+        db_device.last_heartbeat = datetime.utcnow()
+        db.commit()
+        return {"message": "Heartbeat received"}
+    else:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+@app.post("/update-ip", status_code=status.HTTP_200_OK)
+async def update_ip(
+    device: DeviceUpdateIP,
+    organization: Organization = Depends(get_org_from_api_key),
+    db: Session = Depends(get_db)
+):
+    db_device = db.query(Device).filter(Device.uuid == device.uuid, Device.org_id == organization.id).first()
+    if db_device:
+        if device.internal_ip:
+            db_device.internal_ip = device.internal_ip
+            db.commit()
+            logger.info(f"Updated IP for device {device.uuid} to {device.internal_ip}")
+            return {"message": "IP updated successfully"}
+        else:
+            logger.warning(f"Received update request for device {device.uuid} with no IP")
+            return {"message": "No IP provided, no update performed"}
+    else:
+        logger.warning(f"Device not found: {device.uuid}")
+        raise HTTPException(status_code=404, detail="Device not found")
+
+# Optional: Endpoint to list devices for an organization
+@app.get("/devices", status_code=status.HTTP_200_OK)
+async def list_devices(
+    organization: Organization = Depends(get_org_from_api_key),
+    db: Session = Depends(get_db)
+):
+    devices = db.query(Device).filter(Device.org_id == organization.id).all()
+    return {
+        "devices": [
+            {
+                "id": device.id,
+                "uuid": device.uuid,
+                "internal_ip": device.internal_ip,
+                "last_heartbeat": device.last_heartbeat
+            } for device in devices
+        ]
+    }
+
+
 
 if __name__ == "__main__":
     import uvicorn

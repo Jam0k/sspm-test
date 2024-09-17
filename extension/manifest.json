@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "SSPM Device Manager",
+  "version": "1.0",
+  "description": "Manages device registration and activity logging for SSPM",
+  "permissions": [
+    "storage",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

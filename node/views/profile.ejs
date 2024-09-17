@@ -1,0 +1,63 @@
+<h1 class="mb-4">User Profile</h1>
+<div id="profile-content" style="display:none;">
+    <div class="card mb-4">
+        <div class="card-body">
+            <div class="row">
+                <div class="col-md-4 text-center">
+                    <img id="userPicture" src="" alt="Profile Picture" class="img-fluid rounded-circle mb-3" style="max-width: 150px;">
+                </div>
+                <div class="col-md-8">
+                    <h2 id="userNickname" class="card-title"></h2>
+                    <p id="userEmail" class="card-text"></p>
+                    <p id="emailVerified" class="card-text"></p>
+                    <p class="card-text">Organization: <span id="orgName"></span></p>
+                    <p class="card-text">Roles: <span id="userRoles"></span></p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="apiKeyManagement" class="card mb-4">
+        <div class="card-body">
+            <h3 class="card-title">API Key Management</h3>
+            <button id="createApiKey" class="btn btn-primary mb-3">Create API Key</button>
+            <button id="listApiKeys" class="btn btn-secondary mb-3">List API Keys</button>
+            <div id="apiKeyList"></div>
+        </div>
+    </div>
+
+    <div id="deviceManagement" class="card">
+        <div class="card-body">
+            <h3 class="card-title">Device Management</h3>
+            <button id="listDevices" class="btn btn-primary mb-3">List Devices</button>
+            <div id="deviceList"></div>
+        </div>
+    </div>
+</div>
+
+<div id="login-prompt" style="display:none;">
+    <p>Please log in to view your profile.</p>
+    <button id="loginButton" class="btn btn-primary">Log In</button>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', async () => {
+    // Wait for auth0Client to be available
+    const checkAuth = setInterval(async () => {
+        if (window.auth0Client) {
+            clearInterval(checkAuth);
+            const isAuthenticated = await window.auth0Client.isAuthenticated();
+            if (isAuthenticated) {
+                document.getElementById('profile-content').style.display = 'block';
+                document.getElementById('login-prompt').style.display = 'none';
+                await loadUserProfile();
+                setupApiKeyManagement();
+                setupDeviceManagement();
+            } else {
+                document.getElementById('profile-content').style.display = 'none';
+                document.getElementById('login-prompt').style.display = 'block';
+            }
+        }
+    }, 100);
+});
+</script>
