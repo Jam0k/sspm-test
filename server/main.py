@@ -179,8 +179,13 @@ def require_roles(roles: List[str]):
         async def wrapper(request: Request, token: HTTPAuthorizationCredentials = Depends(token_auth_scheme), db: Session = Depends(get_db)):
             token_claims = get_token_claims(token.credentials)
             user = refresh_user_data(db, token_claims)
-            user_roles = [role.name for role in user.roles]
-            if not any(role in user_roles for role in roles):
+            user_roles = set(role.name for role in user.roles)
+            
+            # Implement role hierarchy
+            if 'Admin' in user_roles:
+                user_roles.add('User')  # Admin inherits User permissions
+            
+            if not set(roles).intersection(user_roles):
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
             return await func(token_claims, db)
         return wrapper
@@ -259,17 +264,20 @@ async def get_org_from_api_key(api_key: str = Header(..., alias="X-API-Key"), db
     return organization
 
 def refresh_user_data(db: Session, user_info: dict):
+    start_time = time.time()
     user_id = user_info['sub']
+    logger.debug(f"Refreshing data for user {user_id}")
+
     user = db.query(User).filter(User.id == user_id).first()
-    
     if not user:
         user = User(id=user_id)
         db.add(user)
-    
-    # Update user information
+        logger.debug(f"Created new user {user_id}")
+
     user.name = user_info.get('name', '')
-    
+
     # Update or create organization
+    org_time = time.time()
     org_id = user_info.get('https://watchhousesspm.com/org_id')
     org_name = user_info.get('https://watchhousesspm.com/org_name')
     if org_id and org_name:
@@ -277,87 +285,51 @@ def refresh_user_data(db: Session, user_info: dict):
         if not org:
             org = Organization(id=org_id, name=org_name)
             db.add(org)
+            logger.debug(f"Created new organization {org_id}")
         elif org.name != org_name:
-            org.name = org_name  # Update org name if it has changed
+            org.name = org_name
+            logger.debug(f"Updated organization name for {org_id}")
         
-        # Ensure user is associated with this organization
         if org not in user.organizations:
-            user.organizations = [org]  # Replace existing org with the new one
+            user.organizations = [org]
+            logger.debug(f"Associated user {user_id} with organization {org_id}")
     elif user.organizations:
-        # Remove organization association if org_id is not present in token
         user.organizations = []
-    
+        logger.debug(f"Removed organization association for user {user_id}")
+    logger.debug(f"Organization update took {time.time() - org_time:.2f} seconds")
+
     # Update roles
+    roles_time = time.time()
     new_roles = set(user_info.get('https://watchhousesspm.com/roles', []))
     current_roles = set(role.name for role in user.roles)
     
-    # Remove roles that are no longer present
-    for role in user.roles[:]:
-        if role.name not in new_roles:
+    roles_to_remove = current_roles - new_roles
+    roles_to_add = new_roles - current_roles
+
+    for role_name in roles_to_remove:
+        role = next((role for role in user.roles if role.name == role_name), None)
+        if role:
             user.roles.remove(role)
+            logger.debug(f"Removed role {role_name} from user {user_id}")
     
-    # Add new roles
-    for role_name in new_roles:
-        if role_name not in current_roles:
-            role = db.query(Role).filter(Role.name == role_name).first()
-            if not role:
-                role = Role(name=role_name)
-                db.add(role)
-            user.roles.append(role)
-    
+    for role_name in roles_to_add:
+        role = db.query(Role).filter(Role.name == role_name).first()
+        if not role:
+            role = Role(name=role_name)
+            db.add(role)
+            logger.debug(f"Created new role {role_name}")
+        user.roles.append(role)
+        logger.debug(f"Added role {role_name} to user {user_id}")
+
+    logger.debug(f"Roles update took {time.time() - roles_time:.2f} seconds")
+
+    commit_time = time.time()
     db.commit()
     db.refresh(user)
+    logger.debug(f"Database commit and refresh took {time.time() - commit_time:.2f} seconds")
+
+    logger.debug(f"Total refresh_user_data time: {time.time() - start_time:.2f} seconds")
     return user
-
-
-
-@app.get("/", status_code=status.HTTP_200_OK)
-async def root():
-    return {"message": "Hello World"}
-
-@app.get("/protected", status_code=status.HTTP_200_OK)
-@require_roles(["User"])
-async def protected_route(token_claims: Dict[str, Any], db: Session = Depends(get_db)):
-    user = refresh_user_data(db, token_claims)
-    return {
-        "message": "This is a protected route",
-        "user": user.name
-    }
-
-@app.get("/admin", status_code=status.HTTP_200_OK)
-@require_roles(["Admin"])
-async def admin_route(token_claims: Dict[str, Any], db: Session = Depends(get_db)):
-    user = refresh_user_data(db, token_claims)
-    return {
-        "message": "This is an admin route",
-        "user": user.name
-    }
-
-@app.get("/user_info", status_code=status.HTTP_200_OK)
-async def user_info(token: HTTPAuthorizationCredentials = Depends(token_auth_scheme), db: Session = Depends(get_db)):
-    start_time = time.time()
-    try:
-        logger.debug("Starting user_info request")
-        token_claims_time = time.time()
-        token_claims = get_token_claims(token.credentials)
-        logger.debug(f"Token claims retrieved in {time.time() - token_claims_time:.2f} seconds")
-
-        refresh_time = time.time()
-        user = refresh_user_data(db, token_claims)
-        logger.debug(f"User data refreshed in {time.time() - refresh_time:.2f} seconds")
-
-        result = {
-            "user_id": user.id,
-            "name": user.name,
-            "org_id": user.organizations[0].id if user.organizations else None,
-            "org_name": user.organizations[0].name if user.organizations else None,
-            "roles": [role.name for role in user.roles]
-        }
-        logger.debug(f"Total user_info request time: {time.time() - start_time:.2f} seconds")
-        return result
-    except Exception as e:
-        logger.error(f"Error in user_info endpoint: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
 
 def refresh_user_data(db: Session, user_info: dict):
     start_time = time.time()
@@ -423,56 +395,74 @@ def refresh_user_data(db: Session, user_info: dict):
     logger.debug(f"Total refresh_user_data time: {time.time() - start_time:.2f} seconds")
     return user
 
-# API KEYS
+@app.get("/", status_code=status.HTTP_200_OK)
+@require_roles(["User"])
+async def root(token_claims: Dict[str, Any], db: Session = Depends(get_db)):
+    return {"message": "Hello World"}
+
+@app.get("/protected", status_code=status.HTTP_200_OK)
+@require_roles(["User"])
+async def protected_route(token_claims: Dict[str, Any], db: Session = Depends(get_db)):
+    user = refresh_user_data(db, token_claims)
+    return {
+        "message": "This is a protected route",
+        "user": user.name
+    }
+
+@app.get("/admin", status_code=status.HTTP_200_OK)
+@require_roles(["Admin"])
+async def admin_route(token_claims: Dict[str, Any], db: Session = Depends(get_db)):
+    user = refresh_user_data(db, token_claims)
+    return {
+        "message": "This is an admin route",
+        "user": user.name
+    }
+
+@app.get("/user_info", status_code=status.HTTP_200_OK)
+@require_roles(["User"])
+async def user_info(token_claims: Dict[str, Any], db: Session = Depends(get_db)):
+    user = refresh_user_data(db, token_claims)
+    logger.info(f"User info requested for user {user.id}")
+    logger.info(f"User roles: {[role.name for role in user.roles]}")
+    response_data = {
+        "user_id": user.id,
+        "name": user.name,
+        "org_id": user.organizations[0].id if user.organizations else None,
+        "org_name": user.organizations[0].name if user.organizations else None,
+        "roles": [role.name for role in user.roles]
+    }
+    logger.info(f"Sending user info response: {response_data}")
+    return response_data
 
 @app.post("/api-keys", status_code=status.HTTP_201_CREATED)
-async def create_api_key(
-    db: Session = Depends(get_db), 
-    token: HTTPAuthorizationCredentials = Depends(token_auth_scheme)
-):
-    token_claims = get_token_claims(token.credentials)
+@require_roles(["Admin"])
+async def create_api_key(token_claims: Dict[str, Any], db: Session = Depends(get_db)):
     user_org_id = token_claims.get('https://watchhousesspm.com/org_id')
     
     if not user_org_id:
         raise HTTPException(status_code=400, detail="User does not belong to an organization")
     
-    if "Admin" not in get_roles(token_claims):
-        raise HTTPException(status_code=403, detail="Only admins can create API keys")
-    
     api_key = generate_api_key(db, user_org_id)
     return {"api_key": api_key}
 
 @app.get("/api-keys", status_code=status.HTTP_200_OK)
-async def list_api_keys(
-    db: Session = Depends(get_db), 
-    token: HTTPAuthorizationCredentials = Depends(token_auth_scheme)
-):
-    token_claims = get_token_claims(token.credentials)
+@require_roles(["Admin"])
+async def list_api_keys(token_claims: Dict[str, Any], db: Session = Depends(get_db)):
     org_id = token_claims.get('https://watchhousesspm.com/org_id')
     
     if not org_id:
         raise HTTPException(status_code=400, detail="User does not belong to an organization")
-    
-    if "Admin" not in get_roles(token_claims):
-        raise HTTPException(status_code=403, detail="Only admins can list API keys")
     
     api_keys = db.query(APIKey).filter(APIKey.org_id == org_id).all()
     return {"api_keys": [{"id": key.id, "key": key.key, "created_at": key.created_at, "last_used": key.last_used} for key in api_keys]}
 
 @app.delete("/api-keys/{key_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_api_key(
-    key_id: str, 
-    db: Session = Depends(get_db), 
-    token: HTTPAuthorizationCredentials = Depends(token_auth_scheme)
-):
-    token_claims = get_token_claims(token.credentials)
+@require_roles(["Admin"])
+async def delete_api_key(key_id: str, token_claims: Dict[str, Any], db: Session = Depends(get_db)):
     org_id = token_claims.get('https://watchhousesspm.com/org_id')
     
     if not org_id:
         raise HTTPException(status_code=400, detail="User does not belong to an organization")
-    
-    if "Admin" not in get_roles(token_claims):
-        raise HTTPException(status_code=403, detail="Only admins can delete API keys")
     
     api_key = db.query(APIKey).filter(APIKey.id == key_id, APIKey.org_id == org_id).first()
     if not api_key:
@@ -483,7 +473,16 @@ async def delete_api_key(
     return
 
 @app.get("/api/org-data", status_code=status.HTTP_200_OK)
-async def get_org_data(org: Organization = Depends(get_org_from_api_key)):
+@require_roles(["User"])
+async def get_org_data(token_claims: Dict[str, Any], db: Session = Depends(get_db)):
+    org_id = token_claims.get('https://watchhousesspm.com/org_id')
+    if not org_id:
+        raise HTTPException(status_code=400, detail="User does not belong to an organization")
+    
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    
     return {
         "org_id": org.id,
         "org_name": org.name,
@@ -491,14 +490,6 @@ async def get_org_data(org: Organization = Depends(get_org_from_api_key)):
         "api_key_count": len(org.api_keys)
     }
 
-
-
-
-
-
-# Device mgmt
-
-# New endpoints for device management
 @app.post("/register-device", status_code=status.HTTP_200_OK)
 async def register_device(
     device: DeviceRegister,
@@ -508,12 +499,10 @@ async def register_device(
     existing_device = db.query(Device).filter(Device.uuid == device.uuid, Device.org_id == organization.id).first()
     
     if existing_device:
-        # Update existing device
         existing_device.internal_ip = device.internal_ip
         existing_device.last_seen = datetime.utcnow()
         message = "Device updated successfully"
     else:
-        # Create new device
         new_device = Device(
             id=secrets.token_urlsafe(16),
             org_id=organization.id,
@@ -526,13 +515,9 @@ async def register_device(
     db.commit()
     return {"message": message}
 
-# Add a new endpoint to list devices for an organization
 @app.get("/devices", status_code=status.HTTP_200_OK)
-async def list_devices(
-    token: HTTPAuthorizationCredentials = Depends(token_auth_scheme),
-    db: Session = Depends(get_db)
-):
-    token_claims = get_token_claims(token.credentials)
+@require_roles(["User"])
+async def list_devices(token_claims: Dict[str, Any], db: Session = Depends(get_db)):
     org_id = token_claims.get('https://watchhousesspm.com/org_id')
     
     if not org_id:
@@ -581,44 +566,6 @@ async def heartbeat(
         return {"message": "Heartbeat received"}
     else:
         raise HTTPException(status_code=404, detail="Device not found")
-
-@app.post("/update-ip", status_code=status.HTTP_200_OK)
-async def update_ip(
-    device: DeviceUpdateIP,
-    organization: Organization = Depends(get_org_from_api_key),
-    db: Session = Depends(get_db)
-):
-    db_device = db.query(Device).filter(Device.uuid == device.uuid, Device.org_id == organization.id).first()
-    if db_device:
-        if device.internal_ip:
-            db_device.internal_ip = device.internal_ip
-            db.commit()
-            logger.info(f"Updated IP for device {device.uuid} to {device.internal_ip}")
-            return {"message": "IP updated successfully"}
-        else:
-            logger.warning(f"Received update request for device {device.uuid} with no IP")
-            return {"message": "No IP provided, no update performed"}
-    else:
-        logger.warning(f"Device not found: {device.uuid}")
-        raise HTTPException(status_code=404, detail="Device not found")
-
-# Optional: Endpoint to list devices for an organization
-@app.get("/devices", status_code=status.HTTP_200_OK)
-async def list_devices(
-    organization: Organization = Depends(get_org_from_api_key),
-    db: Session = Depends(get_db)
-):
-    devices = db.query(Device).filter(Device.org_id == organization.id).all()
-    return {
-        "devices": [
-            {
-                "id": device.id,
-                "uuid": device.uuid,
-                "internal_ip": device.internal_ip,
-                "last_heartbeat": device.last_heartbeat
-            } for device in devices
-        ]
-    }
 
 if __name__ == "__main__":
     import uvicorn

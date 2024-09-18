@@ -1,11 +1,107 @@
 body {
-    font-family: Arial, sans-serif;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen-Sans, Ubuntu, Cantarell, 'Helvetica Neue', sans-serif;
+    color: #333;
 }
 
-.card-img-top {
-    width: 100px;
-    height: 100px;
+.navbar {
+    padding: 1rem 0;
+}
+
+.navbar-brand {
+    font-size: 1.5rem;
+    letter-spacing: -0.5px;
+}
+
+.nav-link {
+    font-weight: 500;
+}
+
+.btn {
+    font-weight: 500;
+    transition: all 0.3s ease;
+}
+
+.btn-primary {
+    background-color: #007aff;
+    border-color: #007aff;
+}
+
+.btn-primary:hover {
+    background-color: #0056b3;
+    border-color: #0056b3;
+}
+
+.btn-outline-primary {
+    color: #007aff;
+    border-color: #007aff;
+}
+
+.btn-outline-primary:hover {
+    background-color: #007aff;
+    color: #fff;
+}
+
+.card {
+    border: none;
+    border-radius: 10px;
+    transition: box-shadow 0.3s ease;
+}
+
+.card:hover {
+    box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+}
+
+.card-title {
+    font-weight: 600;
+    color: #007aff;
+}
+
+#userPicture {
+    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    width: 150px;
+    height: 150px;
     object-fit: cover;
-    margin: 20px auto;
-    border-radius: 50%;
+}
+
+#userNickname {
+    font-size: 1.8rem;
+    font-weight: 600;
+    color: #333;
+}
+
+#apiKeyList p, #deviceList p {
+    background-color: #f8f9fa;
+    padding: 10px;
+    border-radius: 5px;
+    margin-bottom: 10px;
+}
+
+.badge {
+    font-size: 0.9rem;
+    padding: 0.5em 1em;
+    border-radius: 20px;
+}
+
+.badge.bg-secondary {
+    background-color: #6c757d !important;
+}
+
+.badge.bg-warning {
+    background-color: #ffc107 !important;
+    color: #000;
+}
+
+@media (max-width: 768px) {
+    .card-body {
+        padding: 1.25rem;
+    }
+    
+    #userPicture {
+        width: 120px;
+        height: 120px;
+    }
+    
+    #userNickname {
+        font-size: 1.5rem;
+    }
 }
