@@ -1,4 +1,4 @@
 {
-    "apiKey": "1aD_X-lZonxLK6EQRdiJM5tDWv_VWCJBqXVdC8-7G-s",
-    "serverUrl": "http://127.0.0.1:8000"
+    "server_ip": "http://127.0.0.1:8000",
+    "api_key": "1aD_X-lZonxLK6EQRdiJM5tDWv_VWCJBqXVdC8-7G-s"
   }

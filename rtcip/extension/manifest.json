@@ -2,13 +2,9 @@
     "manifest_version": 3,
     "name": "Chrome RTC Proxy IP Logger",
     "version": "1.0",
-    "description": "Sets up a local RTC proxy, logs IP address, and communicates with FastAPI server",
+    "description": "Sets up a local RTC proxy and logs IP address",
     "permissions": [
-      "storage",
-      "alarms"
-    ],
-    "host_permissions": [
-      "<all_urls>"
+      "webNavigation"
     ],
     "background": {
       "service_worker": "background.js"

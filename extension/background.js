@@ -1,107 +1,129 @@
-let serverUrl = '';
-let apiKey = '';
-let uuid = '';
-let internalIp = '';
-let sessionId = '';
+console.log("Background script started");
+
+let config = null;
+let browserUUID = null;
+let sessionId = null;
+
+// Load config, generate UUID and session ID
+chrome.storage.local.get(['config', 'browserUUID'], function(result) {
+  if (result.config) {
+    config = result.config;
+    console.log("Config loaded:", config);
+  } else {
+    console.log("Config not found, loading from file");
+    loadConfig();
+  }
+  
+  if (result.browserUUID) {
+    browserUUID = result.browserUUID;
+    console.log("Existing browser UUID:", browserUUID);
+  } else {
+    browserUUID = generateUUID();
+    chrome.storage.local.set({browserUUID: browserUUID});
+    console.log("New browser UUID generated:", browserUUID);
+  }
+
+  // Always generate a new session ID when the script starts
+  sessionId = generateSessionId();
+  console.log("New session ID generated:", sessionId);
+});
+
+function loadConfig() {
+  fetch(chrome.runtime.getURL('config.json'))
+    .then(response => response.json())
+    .then(data => {
+      config = data;
+      chrome.storage.local.set({config: config});
+      console.log("Config loaded and saved:", config);
+    })
+    .catch(error => console.error('Error loading config:', error));
+}
 
 function generateUUID() {
-  return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>
-    (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16)
-  );
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
 }
 
 function generateSessionId() {
-  return Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
-}
-
-async function registerOrUpdateDevice() {
-  try {
-    console.log('Registering/updating device with:', { uuid, internalIp, sessionId });
-    const response = await fetch(`${serverUrl}/register-device`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-API-Key': apiKey
-      },
-      body: JSON.stringify({
-        uuid,
-        internal_ip: internalIp,
-        session_id: sessionId
-      }),
-    });
-    
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`HTTP error! status: ${response.status}, message: ${errorText}`);
-    }
-    
-    const responseData = await response.json();
-    console.log('Device registered/updated successfully:', responseData);
-  } catch (error) {
-    console.error('Failed to register/update device:', error);
-  }
-}
-
-async function initializeExtension() {
-  console.log('Initializing extension...');
-  
-  // Load config
-  try {
-    const response = await fetch(chrome.runtime.getURL('config.json'));
-    const config = await response.json();
-    apiKey = config.apiKey;
-    serverUrl = config.serverUrl;
-    console.log('Loaded config:', { serverUrl, apiKey: apiKey.substring(0, 5) + '...' });
-  } catch (error) {
-    console.error('Failed to load config:', error);
-    return;
-  }
-
-  // Generate or retrieve UUID
-  try {
-    const result = await new Promise(resolve => chrome.storage.local.get(['uuid'], resolve));
-    if (result.uuid) {
-      uuid = result.uuid;
-    } else {
-      uuid = generateUUID();
-      await new Promise(resolve => chrome.storage.local.set({ uuid }, resolve));
-    }
-    console.log('UUID:', uuid);
-  } catch (error) {
-    console.error('Failed to get/set UUID:', error);
-    return;
-  }
-
-  // Generate session ID
-  sessionId = generateSessionId();
-  console.log('Session ID:', sessionId);
-
-  // Inject content script to get internal IP
-  chrome.tabs.query({active: true, currentWindow: true}, function(tabs) {
-    if (tabs[0]) {
-      chrome.tabs.executeScript(tabs[0].id, {file: 'content.js'});
-    }
-  });
-
-  console.log('Extension initialized');
+  return Date.now().toString();
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.action === 'setInternalIp') {
-    internalIp = message.ip;
-    console.log('Internal IP set:', internalIp);
-    registerOrUpdateDevice();
+  if (message.type === "SYNC_DEVICE") {
+    console.log("Sync requested with IP:", message.ip);
+    registerOrUpdateDevice(message.ip, sendResponse);
+    return true;  // Indicates we will send a response asynchronously
   }
 });
 
-chrome.runtime.onInstalled.addListener(initializeExtension);
-chrome.runtime.onStartup.addListener(initializeExtension);
+function registerOrUpdateDevice(ip, sendResponse) {
+  if (!config || !browserUUID || !sessionId) {
+    console.log("Config, browserUUID, or sessionId not available, retrying in 5 seconds");
+    setTimeout(() => registerOrUpdateDevice(ip, sendResponse), 5000);
+    return;
+  }
 
-// Periodic updates
-setInterval(async () => {
-  chrome.tabs.query({active: true, currentWindow: true}, function(tabs) {
-    if (tabs[0]) {
-      chrome.tabs.executeScript(tabs[0].id, {file: 'content.js'});
-    }
+  const endpoint = `${config.server_ip}/register-device`;
+  
+  fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': config.api_key
+    },
+    body: JSON.stringify({
+      uuid: browserUUID,
+      internal_ip: ip,
+      session_id: sessionId
+    })
+  })
+  .then(response => response.json())
+  .then(data => {
+    console.log("Device registration/update response:", data);
+    // Start heartbeat after successful registration
+    setupHeartbeat();
+    sendResponse({success: true});
+  })
+  .catch(error => {
+    console.error('Error registering/updating device:', error);
+    sendResponse({success: false});
   });
-}, 5 * 60 * 1000); // Every 5 minutes
+}
+
+function setupHeartbeat() {
+  chrome.alarms.create('heartbeat', { periodInMinutes: 5 });
+}
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === 'heartbeat') {
+    sendHeartbeat();
+  }
+});
+
+function sendHeartbeat() {
+  if (!config || !browserUUID || !sessionId) {
+    console.log("Config, browserUUID, or sessionId not available for heartbeat");
+    return;
+  }
+
+  const endpoint = `${config.server_ip}/heartbeat`;
+  
+  fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': config.api_key
+    },
+    body: JSON.stringify({
+      uuid: browserUUID,
+      session_id: sessionId
+    })
+  })
+  .then(response => response.json())
+  .then(data => console.log("Heartbeat response:", data))
+  .catch(error => console.error('Error sending heartbeat:', error));
+}
+
+console.log("Background script loaded");

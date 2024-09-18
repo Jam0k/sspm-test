@@ -18,8 +18,7 @@ function createProxyConnection() {
       if (ip) {
         console.log("Extracted IP:", ip);
         document.getElementById('ipAddress').textContent = ip;
-        // Store the IP in chrome.storage instead of sending message immediately
-        chrome.storage.local.set({lastExtractedIP: ip});
+        chrome.runtime.sendMessage({type: "IP_EXTRACTED", ip: ip});
       }
     }
   };
@@ -52,25 +51,11 @@ function handleSendChannelStatusChange(event) {
   }
 }
 
-document.getElementById('syncButton').addEventListener('click', function() {
-  chrome.storage.local.get('lastExtractedIP', function(result) {
-    if (result.lastExtractedIP) {
-      chrome.runtime.sendMessage({type: "SYNC_DEVICE", ip: result.lastExtractedIP}, function(response) {
-        if (response && response.success) {
-          document.getElementById('syncMessage').textContent = "Sync successful!";
-        } else {
-          document.getElementById('syncMessage').textContent = "Sync failed. Please try again.";
-        }
-      });
-    } else {
-      document.getElementById('syncMessage').textContent = "No IP detected. Please wait and try again.";
-    }
-  });
-});
+document.getElementById('refreshButton').addEventListener('click', createProxyConnection);
 
-chrome.storage.local.get('browserUUID', function(result) {
-  if (result.browserUUID) {
-    document.getElementById('browserUUID').textContent = result.browserUUID;
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === "CREATE_PROXY") {
+    createProxyConnection();
   }
 });
 
